@@ -9,6 +9,7 @@ fx_verification_pipeline.py 테스트 스위트.
 - 새 픽스처를 만들기보다 sample_data/, robustness_test/의 기존 파일을 재사용한다.
 """
 import os
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -248,6 +249,67 @@ class TestVerifyWithEvidence:
                                   "외화금액": 1000, "회사적용환율(내재)": 1400.0}])
         result = fxp.verify_with_evidence(flagged)
         assert result.iloc[0]["증빙상태"] == "OCR 호출 실패 - 수기 확인 필요"
+
+
+class TestOcrRecheckSample:
+    """'적정(증빙과 일치)' 판정 건 중 일부를 QC 표본으로 뽑는 _select_ocr_recheck_sample().
+    고정 시드(OCR_RECHECK_SAMPLE_SEED)를 쓰므로 표본 크기는 결정론적으로 검증 가능하다."""
+
+    def test_marks_ceil_of_rate_percent_of_matched_rows(self):
+        rows = [{"거래ID": f"TXN{i}", "최종판정": "적정(증빙과 일치)"} for i in range(20)]
+        fxp._select_ocr_recheck_sample(rows)
+        sampled = [r for r in rows if r["OCR재확인표본"] is not None]
+        expected = math.ceil(20 * fxp.OCR_RECHECK_SAMPLE_RATE)
+        assert len(sampled) == expected
+
+    def test_single_matched_row_still_gets_sampled(self):
+        rows = [{"거래ID": "TXN1", "최종판정": "적정(증빙과 일치)"}]
+        fxp._select_ocr_recheck_sample(rows)
+        assert rows[0]["OCR재확인표본"] is not None
+
+    def test_no_matched_rows_column_still_added_as_none(self):
+        # 매칭된 행이 0건이어도 컬럼 자체는 항상 채워져야 build_fx_detail_report()의
+        # 컬럼 선택(verified[[..., "OCR재확인표본"]])이 KeyError 없이 동작한다.
+        rows = [{"거래ID": "TXN1", "최종판정": "부적정(증빙과 불일치 - 재계산 필요)"}]
+        fxp._select_ocr_recheck_sample(rows)
+        assert rows[0]["OCR재확인표본"] is None
+
+    def test_non_matched_rows_are_never_sampled(self):
+        rows = [
+            {"거래ID": "TXN1", "최종판정": "적정(증빙과 일치)"},
+            {"거래ID": "TXN2", "최종판정": "부적정(증빙과 불일치 - 재계산 필요)"},
+            {"거래ID": "TXN3", "최종판정": "미확인(증빙 미확보)"},
+        ]
+        fxp._select_ocr_recheck_sample(rows)
+        assert rows[1]["OCR재확인표본"] is None
+        assert rows[2]["OCR재확인표본"] is None
+
+    def test_sample_text_never_overlaps_flag_keywords(self):
+        # Exception(빨간색 하이라이트) 목록에 QC 표본이 섞여 들어가면 안 되므로,
+        # 표시 문구가 FLAG_KEYWORDS(이상치/부적정/오류/불일치/누락/미확인/재검토 필요/확인 필요)
+        # 와 절대 겹치지 않아야 한다.
+        rows = [{"거래ID": "TXN1", "최종판정": "적정(증빙과 일치)"}]
+        fxp._select_ocr_recheck_sample(rows)
+        text = rows[0]["OCR재확인표본"]
+        assert not any(k in text for k in fxp.FLAG_KEYWORDS)
+
+
+class TestOcrRecheckSampleIntegration:
+    def test_ocr_recheck_column_flows_into_fx_detail_report(self, sample_pipeline_inputs,
+                                                              monkeypatch, tmp_path):
+        journal, _schedule = sample_pipeline_inputs
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _make_fake_fetch(SAMPLE_FAKE_RATES))
+        # 증빙 폴더를 빈 임시경로로 돌려 OCR(실제 API) 호출 자체가 일어나지 않게 한다.
+        monkeypatch.setattr(fxp, "EVIDENCE_DIR", str(tmp_path / "no_evidence"))
+
+        settlements = fxp.extract_settlement_transactions(journal)
+        screened = fxp.screen_fx_settlements(settlements)
+        ref_check = fxp.detect_reference_date_mismatch(settlements)
+        verified = fxp.verify_with_evidence(screened)
+        fx_detail = fxp.build_fx_detail_report(screened, ref_check, verified)
+
+        assert "OCR재확인표본" in verified.columns
+        assert "OCR재확인표본" in fx_detail.columns
 
 
 class _FakeTextBlock:

@@ -29,6 +29,8 @@ import os
 import re
 import json
 import time
+import math
+import random
 import base64
 import argparse
 from datetime import datetime, timedelta
@@ -51,6 +53,11 @@ EXIM_BASE_URL = "https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSO
 TOLERANCE_PCT = 0.05          # 1단계 이상치 판단 기준: 괴리율 5%
 GAIN_LOSS_TOLERANCE_KRW = 1000  # 재계산 금액과 회사 계상액의 허용 오차(원 단위 반올림 차이)
 AMPT = float(os.environ.get("FX_AMPT", 3000000))  # 허용가능 오류금액(Tolerable Misstatement) - 감사팀 산정치로 교체
+
+# 2단계 OCR이 "적정(증빙과 일치)"로 판정한 건 중 일부를 QC 표본으로 재확인하기 위한 비율.
+# 거래 자체가 아니라 OCR 판정 로직의 신뢰성(위음성 여부)을 점검하는 목적.
+OCR_RECHECK_SAMPLE_RATE = float(os.environ.get("FX_OCR_RECHECK_RATE", 0.15))
+OCR_RECHECK_SAMPLE_SEED = 42  # 같은 입력이면 같은 표본이 뽑히도록 고정 (감사조서 재현성)
 
 CUR_UNIT_MAP = {
     "USD": "USD", "JPY": "JPY(100)", "EUR": "EUR", "CNH": "CNH", "CNY": "CNH",
@@ -617,12 +624,29 @@ def extract_rate_from_evidence(image_path: str) -> dict:
         return {"error": "JSON 파싱 실패", "raw_text": raw_text}
 
 
+def _select_ocr_recheck_sample(rows: list) -> None:
+    """OCR이 '적정(증빙과 일치)'로 판정한 행 중 일부를 골라 'OCR재확인표본' 플래그를 붙인다.
+    '불일치' 판정 건은 이미 Exception으로 전수 확인 대상이 되므로 손대지 않는다 - 여기서
+    보는 것은 거래 자체의 적정성이 아니라, OCR이 실제로는 불일치인데 일치로 오판(위음성)하지
+    않았는지를 감사인이 표본으로 재확인하기 위한 QC 절차다. 고정 시드를 써서 같은 입력이면
+    같은 표본이 뽑히도록 한다(감사조서 재현성). 문구는 FLAG_KEYWORDS와 겹치지 않게 골라
+    Exception 하이라이트에 섞이지 않도록 한다."""
+    matched = [r for r in rows if r.get("최종판정") == "적정(증빙과 일치)"]
+    sampled_ids = set()
+    if matched:
+        sample_size = min(len(matched), max(1, math.ceil(len(matched) * OCR_RECHECK_SAMPLE_RATE)))
+        sampled_ids = {id(r) for r in random.Random(OCR_RECHECK_SAMPLE_SEED).sample(matched, sample_size)}
+    # 매칭된 행이 0건이어도 컬럼 자체는 항상 채워야, 호출부가 dtype/컬럼 접근 시 KeyError가 안 난다.
+    for r in rows:
+        r["OCR재확인표본"] = "재확인 대상(QC 표본)" if id(r) in sampled_ids else None
+
+
 def verify_with_evidence(flagged_df: pd.DataFrame) -> pd.DataFrame:
     """1단계에서 플래그된 건에 대해 증빙 파일이 있으면 OCR로 검증, 없으면 '증빙요청필요' 표시.
     정밀검증 대상이 0건(이상치가 하나도 없는 정상적인 기간)이어도, 호출부가 기대하는
     컬럼이 빠지지 않도록 빈 DataFrame에도 컬럼 구조를 유지해서 반환한다."""
     if flagged_df.empty:
-        return pd.DataFrame(columns=list(flagged_df.columns) + ["증빙상태", "증빙확인환율", "최종판정"])
+        return pd.DataFrame(columns=list(flagged_df.columns) + ["증빙상태", "증빙확인환율", "최종판정", "OCR재확인표본"])
 
     rows = []
     for _, row in flagged_df.iterrows():
@@ -671,6 +695,7 @@ def verify_with_evidence(flagged_df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append(record)
 
+    _select_ocr_recheck_sample(rows)
     return pd.DataFrame(rows)
 
 
@@ -1173,7 +1198,7 @@ def build_fx_detail_report(screened: pd.DataFrame, ref_check: pd.DataFrame,
     if verified is not None and not verified.empty:
         verified = verified.copy()
         verified["결제일"] = pd.to_datetime(verified["결제일"])
-        verify_extra = verified[["거래ID", "결제일", "증빙상태", "증빙확인환율", "최종판정"]]
+        verify_extra = verified[["거래ID", "결제일", "증빙상태", "증빙확인환율", "최종판정", "OCR재확인표본"]]
         merged = merged.merge(verify_extra, on=["거래ID", "결제일"], how="left")
         merged["증빙상태"] = merged["증빙상태"].fillna("증빙검증 대상 아님(1차 스크리닝 적정 통과)")
     return merged
@@ -1437,6 +1462,14 @@ def generate_audit_workpaper(output_path: str, *, screened: pd.DataFrame, agg: d
                     cells[c].text = str(val) if val is not None else "-"
     else:
         doc.add_paragraph("(해당 없음)")
+
+    if "OCR재확인표본" in fx_detail.columns:
+        recheck_count = fx_detail["OCR재확인표본"].notna().sum()
+        doc.add_paragraph(
+            f"OCR 재확인 표본(QC): {recheck_count:,}건 — OCR이 '증빙과 일치'로 판정한 건 중 "
+            "위음성 여부를 감사인이 별도로 재확인하기 위해 자동 추출한 표본이다. Exception과는 "
+            "별개이며, 재확인 결과 OCR 오류가 발견되면 표본 확대 또는 전수 재검토로 전환한다."
+        )
 
     # 5. 결론
     doc.add_heading("5. 결론", level=1)
